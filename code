@@ -1,0 +1,620 @@
+library(data.table)
+library(openxlsx)
+library(ggplot2)
+library(tensorflow)
+library(dplyr)
+library(keras)
+library(Metrics)
+library(ggpubr)
+library(rmgarch)
+library(remotes)
+library(data.table)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(tidyr)
+
+#Importing data-----------------------------------------------------------------
+asset_names = c("BTC",	"ETH", "BNB",	"XRP", "ADA", "IOTA",	"XLM",	"XMR",	"BCH", "ETC")
+
+prices = read.xlsx("/Data/crypto_08.xlsx","prices", rows = 1:2558, cols = 2:12) 
+head(prices)
+year = prices$anno
+
+prices$anno = NULL
+colnames(prices)=asset_names
+prices=as.matrix(prices)
+
+# Computing_log-returns---------------------------------------------------------
+log_returns = diff(log(prices))
+head(log_returns)
+portion = (seq(1:dim(log_returns)[1]-1)/dim(log_returns)[1])*7+2018
+market_values = read.xlsx("D:/Phd Research/Neural/Data/crypto_08.xlsx","MVs", rows = 1:2558, cols = 2:12) #%>%data.table()
+colnames(market_values)=asset_names
+prices=data.table(prices)
+#Apply the function to normalize the market values------------------------------
+market_values = t(apply(market_values, 1, function(x) x / sum(x) ))
+head(market_values)
+subtot = log_returns*market_values[-1,]
+
+head(subtot)
+w_port = apply(subtot, 1, sum)
+
+head(w_port)
+N=dim(log_returns)
+
+log_returns = data.table(log_returns)
+log_returns$index = 1:(N[1])
+head(log_returns$index)
+log_returns$portfolio = w_port
+head(log_returns$portfolio)
+log_returns$year = portion
+head(log_returns$year)
+table_log_returns = melt(log_returns, measure.vars = colnames(log_returns)[1:10])
+head(table_log_returns)
+plt1 <- ggplot(table_log_returns,
+             aes(x = portfolio,
+                 y = value,
+                 color = year) +   
+  geom_point(size = 0.5) +
+  facet_wrap(~ variable, ncol = 4) +
+  scale_color_viridis_c(option = "viridis", name = "Year") +
+  labs(x = "Portfolio", y = "Value")+
+  theme_pubr(base_family = "Times New Roman", base_size = 10)+ 
+  theme(legend.position = "right")
+
+plt1
+table_log_returns[,Asset_fact:=as.integer(as.factor(variable))-1]
+#Q-CNN-LSTM Model
+wind <- 100
+samples <- (N[1] - wind)
+x_train <- array(dim = c(samples, wind, N[2]))
+y_train <- array(dim = c(samples, 1, N[2]))
+y_train_sys <- array(dim = c(samples, 1, N[2]))
+for (i in 1:(N[1] - wind)) {
+  for (asset_index in unique(table_log_returns$variable)) {
+    k <- table_log_returns[variable == asset_index]$Asset_fact %>% unique() + 1
+    x_train[i,,k] <- table_log_returns[index %in% c(i:(i + wind - 1)) & variable == asset_index]$value
+    y_train[i,1,k] <- table_log_returns[index == (i + wind) & variable == asset_index]$value
+    y_train_sys[i,1,k] <- table_log_returns[index == (i + wind) & variable == asset_index]$portfolio
+  }
+}
+
+tilted_loss_median <- function( y, f) {
+  q = 0.5
+  e <- y - f
+  k_mean(k_maximum(q * e, (q - 1) * e),axis = c(1,2))
+}
+
+tilted_loss_lower <- function( y, f) {
+  q = 0.01
+  e <- y - f
+  k_mean(k_maximum(q * e, (q - 1) * e),axis = c(1,2))
+}
+set.seed(2025)
+act = "tanh"
+act_var = "linear"
+act_covar = "linear"
+library(keras)
+options(keras.view_metrics = FALSE)
+
+k_clear_session()
+
+set_random_seed(2025)
+
+#Initializer objects------------------------------------------------------------
+k_init_conv   <- initializer_glorot_uniform()
+b_init_conv   <- initializer_zeros()
+#-------------------------------------------------------------------------------
+k_init_lstm   <- initializer_ones()
+r_init_lstm   <- initializer_orthogonal()
+b_init_lstm   <- initializer_zeros()
+#-------------------------------------------------------------------------------
+u =30
+rates <- layer_input(shape = c(wind, N[2]), dtype = 'float32', name = 'rates')
+
+# Convolutional Layer
+conv_features<- rates%>%
+  layer_conv_1d(filters =100, kernel_size =2, activation = 'relu'
+                ,kernel_initializer = k_init_conv
+                ,bias_initializer   = b_init_conv)%>%
+  layer_max_pooling_1d(pool_size = 2)
+
+# LSTM Layers
+features_median <- conv_features%>%
+  layer_lstm(units = u, name = "feature_median"
+             ,kernel_initializer   = k_init_lstm,
+             recurrent_initializer= r_init_lstm,
+             bias_initializer     = b_init_lstm)
+features_quantile <- conv_features%>%
+  layer_lstm(units = u, name = "feature_quantile"
+             ,kernel_initializer   = k_init_lstm,
+             recurrent_initializer= r_init_lstm,
+             bias_initializer     = b_init_lstm)
+
+# Dense Layers
+var_median <- features_median %>%
+  layer_dropout(0.12) %>%
+  layer_dense(units = N[2], activation = "tanh", name = "var_median") %>%
+  layer_dropout(0.12) %>%
+  layer_reshape(c(1, N[2]))
+pre_quantile <- features_quantile %>%
+  layer_dropout(0.12) %>%
+  layer_dense(units = N[2], activation = 'relu') %>%
+  layer_dropout(0.12) %>%
+  layer_reshape(c(1, N[2]), name = "pre_quantile")
+var_quantile <- var_median %>% list(pre_quantile) %>%
+  layer_subtract() %>%
+  layer_reshape(c(1, N[2]))
+
+d <- layer_dense(units = 1, activation = "linear"
+                 , kernel_constraint = constraint_nonneg()
+                 , bias_constraint = constraint_nonneg())
+covar_median <- var_median %>%
+  layer_reshape(c(N[2], 1)) %>%
+  time_distributed(d) %>%
+  layer_reshape(c(1, N[2]), name = "covar_median")
+
+#Model Compilation
+model <- keras_model(
+  inputs = list(rates),
+  outputs = c(var_median, var_quantile, covar_median)
+)
+adam = optimizer_nadam()
+model %>% compile(loss = list(tilted_loss_median, tilted_loss_lower, tilted_loss_lower)
+                  , optimizer = adam, metrics = c('mse'))
+
+w0 = get_weights(model)
+lr_callback = callback_reduce_lr_on_plateau(monitor = "loss",factor=.50, patience =5,
+                                             verbose=1, min_lr = 0.001)
+model_callback <- callback_model_checkpoint(monitor = "loss"
+                  , filepath = "../data/systemic_risk/cp.ckpt", verbose = 1
+                  , save_best_only = TRUE, save_weights_only = TRUE)
+
+fit <- model %>% keras::fit(x = list(x_train),
+                            y= list(y_train, y_train, y_train_sys),
+                            epochs= 100,
+                            batch_size=100,
+                            verbose=2,
+                            callbacks = list(lr_callback,model_callback),
+                            shuffle=T)
+
+fitted = model %>% load_model_weights_tf(filepath =  "../data/systemic_risk/cp.ckpt")
+all_w = get_weights(fitted)
+
+k_clear_session()
+
+rates <- layer_input(shape = c(wind, N[2]), dtype = "float32", name = "rates")
+
+conv<- rates %>%                                       
+  layer_conv_1d(filters =100, kernel_size =2,
+                activation = 'relu',
+                name = "conv",
+                weights = list(all_w[[1]], all_w[[2]]))%>%
+  layer_max_pooling_1d(pool_size =2)
+
+features_median = conv %>%layer_lstm(units = u,weights = list(all_w[[3]], all_w[[4]], 
+                                                      all_w[[5]]), name = "feature_median")
+features_quantile = conv%>%layer_lstm(units = u,weights = list(all_w[[6]], all_w[[7]],
+                                                            all_w[[8]]),name = "feature_quantile")
+var_median =  features_median %>% layer_dense(units = N[2],weights = list(all_w[[9]], all_w[[10]])
+                        , activation = "tanh",  name = "var_median") %>%layer_reshape(c(1,N[2]))
+pre_quantile =features_quantile %>% layer_dense(units = N[2], activation ='relu',
+                  weights = list(all_w[[11]],all_w[[12]])) %>%layer_reshape(c(1,N[2]), name = "pre_quantile")
+
+var_quantile = var_median %>% list(pre_quantile) %>% layer_subtract()%>%layer_reshape(c(1,N[2]))
+
+d = layer_dense(units = 1, activation =act_covar, kernel_constraint = constraint_nonneg(), bias_constraint = constraint_nonneg())
+covar_median = var_median %>%
+  layer_reshape(c(N[2],1)) %>%time_distributed(d, weights = list(all_w[[13]], all_w[[14]])) %>% 
+  layer_reshape(c(1,N[2]), name = "covar_median")  
+
+covar_quantile = var_quantile %>%
+            layer_reshape(c(N[2],1)) %>%time_distributed(d, weights = list(all_w[[13]], all_w[[14]])) %>% 
+        layer_reshape(c(1,N[2]), name = "covar_quantile")  
+model <- keras_model(
+  inputs = list(rates), 
+  outputs = c(var_median, var_quantile, covar_median, covar_quantile))
+k = 1
+y_hat = predict(model, x = list(x_train))
+y_2 = y_train
+dim(y_2) = dim(y_train)[-2]
+colnames(y_2) = asset_names
+y_2 = data.table(y_2)
+y_2$time = tail(portion, dim(y_2)[1])
+table_y2 = melt(y_2, measure.vars = colnames(y_2)[1:N[2]])
+table_y2$data = "actual value"
+y_hat_1 = y_hat[[1]]
+dim(y_hat_1) = dim(y_hat_1)[-2]
+colnames(y_hat_1) = asset_names
+y_hat_1 = data.table(y_hat_1)
+y_hat_1$time = tail(portion, dim(y_hat_1)[1])
+table_y1_hat = melt(y_hat_1, measure.vars = colnames(y_hat_1)[1:N[2]])
+table_y1_hat$data = "median"
+y_hat_2 = y_hat[[2]]
+dim(y_hat_2) = dim(y_hat_2)[-2]
+colnames(y_hat_2) = asset_names
+y_hat_2 = data.table(y_hat_2)
+y_hat_2$time = tail(portion, dim(y_hat_2)[1])
+table_y2_hat = melt(y_hat_2, measure.vars = colnames(y_hat_2)[1:N[2]])
+table_y2_hat$data = "quantile"
+
+# Realised log-returns vs fitted values
+plot_data = rbind(table_y2, table_y1_hat, table_y2_hat) %>% data.table()
+colnames(plot_data) = c("time", "asset", "value", "data")
+
+#png('../results/figs/fig4.png')
+plt2 = ggplot(plot_data, aes(time, value, color= data)) + 
+  geom_line()+facet_wrap(~asset, ncol = 4)+ scale_color_manual(values=c("#444444", "green", "#d95f02"))+
+  labs(x = "Time", y = "")+
+  theme_pubr(base_family = "Times New Roman", base_size = 10)+ 
+  theme(legend.position = "right")
+plt2
+plot_data = rbind(table_y2, table_y1_hat, table_y2_hat) %>% data.table()
+table_data = dcast(plot_data, variable+time ~ data, value.var = "value")
+colnames(table_data)[3] = "actual"
+
+table_data = data.table(table_data)
+
+pinball <- function( y, f = 0, tau = 0.01) {
+  e <- y - f
+  mean(pmax(e*tau, (tau-1)*e))
+}
+
+res = table_data[,.(RMSE = round(sqrt(mean((actual - median)^2)),4), Pinball = round(pinball(actual - median),4)),    keyby =.(variable)]
+
+table13 =  rbind(res, data.table(variable = "Global", RMSE =table_data[,.(RMSE = round(sqrt(mean((actual - median)^2)),4), Pinball = round(pinball(actual - median),4)),]$RMSE,
+                                Pinball = table_data[,.(RMSE = round(sqrt(mean((actual - median)^2)),4), Pinball = round(pinball(actual - median),4)),]$Pinball))
+table13 
+#-------------------------------------------------------------------------------
+delta_covar = y_hat[[4]]-y_hat[[3]]
+dim(delta_covar) = c(N[1]-wind,N[2])
+colnames(delta_covar) = asset_names
+apply(delta_covar, 2,mean)
+all_corrNN = data.table()
+for(k in 1:dim(delta_covar)[2]){
+  bacf <- acf(delta_covar[,k],lag.max = 120, plot = F)
+  bacfdf <- with(bacf, data.frame(lag, acf))
+  bacfdf$asset = colnames(delta_covar)[k]
+  all_corrNN = rbind(all_corrNN, bacfdf)
+}
+# --------------------------------------------------------------------------
+q=qnorm(0.01,mean=0,sd=1)
+delta_covar_garch=matrix(nrow=N[1],ncol=N[2])
+delta_covar_garch = data.table(delta_covar_garch)
+fitted_returns_garch=matrix(nrow=N[1],ncol=N[2])
+fitted_returns_garch=data.table(fitted_returns_garch)
+MSE_garch=matrix(nrow=1,ncol=N[2])
+MSE_garch=data.table(MSE_garch)
+
+# --------------------------------------------------------------------------
+p_values=rep(0, N[2])
+log_returns=as.matrix(log_returns)
+for (i in 1:N[2]){
+  
+  current_data <- data.frame(asset = log_returns[, i], sys = w_port)
+  
+  # Set up GARCH and DCC spec as per your requirements
+  ug <- ugarchspec(
+    variance.model = list(model = "eGARCH", garchOrder = c(1, 1)),
+    mean.model     = list(armaOrder = c(1,1)), 
+    distribution.model = "norm")
+  
+  cc_spec <- dccspec(
+    uspec        = multispec(replicate(2, ug)), 
+    dccOrder     = c(1,1),
+    model        = "DCC",
+    distribution = "mvt"
+  )       
+  
+  dcc_fit <- dccfit(
+    cc_spec,
+    data = current_data,
+    fit.control = list(eval.se = TRUE, stationarity = TRUE, scale= TRUE),
+    solver = "solnp",
+    solver.control = list(trace = 0, maxit = 3000, tol = 1e-4, delta=1e-4)
+  )
+  
+  
+  sigma_t <- sigma(dcc_fit)
+  rho_t   <- rcor(dcc_fit)[1, 2, ]
+  
+  hat_sigma_sys <- sigma_t[, 2]
+  hat_sigma_i   <- sigma_t[, 1]
+  
+  # Delta CoVaR estimation (quantile, adjust q as needed)
+  delta_covar_garch[[i]] <- q * rho_t * hat_sigma_sys
+  setnames(delta_covar_garch, i, colnames(log_returns)[i])
+  
+  eta_i <- residuals(dcc_fit)[, 1]
+  fitted_returns_garch[[i]] <- hat_sigma_i * eta_i  # Note: no sqrt for volatility, as sigma_t already gives SD
+  setnames(fitted_returns_garch, i, colnames(log_returns)[i])
+  
+  MSE_garch[[i]] <- rmse(log_returns[, i], fitted_returns_garch[[i]])
+  setnames(MSE_garch, i, colnames(log_returns)[i])
+}
+
+
+delta_covar_garch = data.table(delta_covar_garch)
+delta_covar_garch$anno = year[-1]
+delta_covar_garch$index = 1:(length(year)-1)
+
+fitted_returns_garch = data.table(fitted_returns_garch)
+fitted_returns_garch$anno = year[-1]
+fitted_returns_garch$index = 1:(length(year)-1)
+
+MSE_garch   <- as.matrix(MSE_garch)
+rownames(MSE_garch)[1] <- "MSE"
+
+log_returns=as.data.table(log_returns)
+covar_garch = delta_covar_garch[,1:10]
+covar_garch=as.matrix(covar_garch)
+delta_covar_garch[,1:10] %>%
+  summarise(across(all_of(asset_names),
+                   ~ sum(. > 0, na.rm = TRUE)))
+# 30-day Moving Average for DCC-GARCH(1,1) Model
+k=30
+
+delta_mobile_garch=matrix(nrow=N[1]-k,ncol=N[2])
+M=dim(delta_mobile_garch)
+M
+
+delta_covar_garch=as.matrix(delta_covar_garch)
+for (i in 1: M[2]){
+  for(j in (k/2+1):(N[1]-k/2)){
+    delta_mobile_garch[(j-k/2),i]=(sum(delta_covar_garch[(j-k/2):(j+k/2),i]))/(k+1)
+  }
+  
+}
+
+delta_mobile_garch = data.table(delta_mobile_garch)
+colnames(delta_mobile_garch)=asset_names
+new_year=year[(k/2+1):(N[1]-k/2)]
+delta_mobile_garch$anno = new_year
+delta_mobile_garch$index = 1:(length(new_year))
+
+table_delta_mobile_garch = melt(delta_mobile_garch, measure.vars = colnames(delta_mobile_garch)[1:N[2]])
+
+average_delta_mobile_garch = table_delta_mobile_garch[,.(value = mean(value)),keyby = .(anno, variable)]
+
+average_delta_mobile_garch = dcast(average_delta_mobile_garch, anno ~ variable)
+
+# Ranking according to the CCC-GARCH(1,1) model
+ranking_garch = t(apply(average_delta_mobile_garch[,-1], 1, rank)) %>% data.table()
+
+ranking_garch$anno = unique(new_year)
+
+table_ranking_garch = melt(ranking_garch, measure.vars = colnames(ranking_garch)[1:N[2]])
+
+ranghi_garch=ranking_garch
+ranghi_garch= t(ranghi_garch[,1:10]) %>% data.frame()
+ranghi_garch$asset = rownames(ranghi_garch)
+ranghi_garch = data.frame(Asset = ranghi_garch$asset, ranghi_garch[,-11])
+colnames(ranghi_garch)[2:8] = ranking_garch$anno
+
+# Autocorrelation
+all_corrGARCH = data.table()
+for(k in 1:N[2]){
+  bacf <- acf(covar_garch[,k],lag.max = 120, plot = F)
+  bacfdf <- with(bacf, data.frame(lag, acf))
+  bacfdf$asset = colnames(delta_covar)[k]
+  all_corrGARCH = rbind(all_corrGARCH, bacfdf)
+}
+all_corrNN$Model = "Q-CNN-LSTM"
+all_corrGARCH$Model = "DCC-GARCH"
+all_corr = rbind(all_corrNN, all_corrGARCH)
+
+#png('../results/figs/fig6.png')
+plt3 <- ggplot(data=all_corr, mapping=aes(x=lag, y=acf, fill = factor(Model))) +labs(fill = "Model")+
+  geom_bar(stat = "identity", alpha = 0.8,position = "identity")+facet_wrap(~asset, ncol = 4)+
+  theme_pubr(base_family = "Times New Roman", base_size = 10)+  labs(x = "Lag",y = "")+
+  theme(legend.position = "right")
+plt3
+# 30-day Moving Average in Q-CNN-LSTM Model
+k = 30
+W = dim(delta_covar)
+delta_mobile=matrix(nrow=W[1]-k,ncol=W[2])
+M=dim(delta_mobile)
+M
+
+for (i in 1: M[2]){
+  for(j in (k/2+1):(W[1]-k/2)){
+    delta_mobile[(j-k/2),i]=(sum(delta_covar[(j-k/2):(j+k/2),i]))/(k+1)
+  }
+  
+}
+delta_mobile = data.table(delta_mobile)
+delta_mobile$time = tail(portion, dim(delta_mobile)[1])
+colnames(delta_mobile)=c(asset_names, "time")
+new_year=year[(k/2+1):(W[1]-k/2)]
+
+table_delta_mobile = melt(delta_mobile, measure.vars = asset_names)
+
+subprime = data.table(value = rep(2018+(11.15/12*365)/365, length(asset_names)), variable = asset_names)
+covid = data.table(value = rep(2020+(3/12*366)/366, length(asset_names)), variable = asset_names)
+china = data.table(value = rep(2021+(4.8/12*365)/365, length(asset_names)), variable = asset_names)
+ftx = data.table(value = rep(2022+(6/12*365)/365, length(asset_names)), variable = asset_names)
+subftx = data.table(value = rep(2024+(4/12*366)/366, length(asset_names)), variable = asset_names)
+#-------------------------------------------------------------------------
+plt4 <- ggplot(table_delta_mobile, aes(time, value)) +
+  geom_line(color = "#000000", linetype = "solid") +  # fixed aesthetics, no mapping
+  facet_wrap(~variable, ncol = 4) +
+  geom_vline(data = subprime, aes(xintercept = value), color = "red", linetype = "dotted", size = 0.8) +
+  geom_vline(data = covid, aes(xintercept = value), color = "blue", linetype = "dotted", size = 0.8) +
+  geom_vline(data = china, aes(xintercept = value), color = "darkgreen", linetype = "dotted", size = 0.8) +
+  geom_vline(data = ftx, aes(xintercept = value), color = "darkorange", linetype = "dotted", size = 0.8) +
+  geom_vline(data = subftx, aes(xintercept = value), color = "yellow4", linetype = "dotted", size = 0.8) +
+  labs(x = "Time", y = expression(Delta * CoVaR)) +
+  theme_pubr(base_family = "Times New Roman", base_size = 10) +
+  theme(legend.position = "none")
+
+plt4
+
+delta_covar = data.table(delta_covar)
+delta_covar$anno = year[(wind+1):(N[1])]
+# Ranking according to the Q-LSTM model
+table_delta_covar = melt(delta_covar, measure.vars = colnames(delta_covar)[1:N[2]])
+average_delta_covar = table_delta_covar[,.(value = mean(value)),keyby = .(anno, variable)]
+average_delta_covar = dcast(average_delta_covar, anno ~ variable)
+ranking = t(apply(average_delta_covar[,-1], 1, rank)) %>% data.table()
+ranking$anno = unique(year)
+table_ranking = melt(ranking, measure.vars = colnames(ranking)[1:N[2]])
+plt5 = ggplot(table_ranking, aes(anno, variable, fill= value)) + 
+  geom_tile(alpha=2) +geom_text(aes(label = round(value, 1))) +
+  scale_fill_gradient(low="#E31A1C", high="#40E0D0") +labs(fill = "Rank", x = "Year", y = "Cryptocurrencies")+
+  theme_pubr()+ 
+  theme(legend.position = "right")
+plt5
+rank_NN = ranking[,-11]
+rank_NN = t(rank_NN) %>% data.frame()
+rank_NN$asset = rownames(rank_NN)
+ranghi_NN = data.frame(Asset = rank_NN$asset, rank_NN[,-11])
+colnames(ranghi_NN)[2:8] = ranking$anno
+
+# Comparing Coefficient
+cogr_garch_time=as.numeric(vector(length=7))
+cogr_garch_time[1]=1
+k=2
+
+for(i in 2:7){
+  cogr_garch_time[k]=cor(ranghi_garch[,i],ranghi_garch[,(i+1)], method='spearman')
+  k=k+1
+}
+
+time=2018:2024
+
+cogr_NN_time=as.numeric(vector(length=7))
+cogr_NN_time[1]=1
+k=2
+
+for(i in 2:7){
+  cogr_NN_time[k]=cor(ranghi_NN[,i],ranghi_NN[,(i+1)], method='spearman')
+  k=k+1
+}
+
+time=2018:2024
+
+cogr_garch_NN_time=as.numeric(vector(length=7))
+k=1
+for(i in 2:7){
+  cogr_garch_NN_time[k]=cor(ranghi_garch[,i],ranghi_NN[,(i)], method='spearman')
+  k=k+1
+}
+
+time=2018:2024
+
+cograd_data = data.table(value = c(cogr_NN_time, cogr_garch_time), time = c(time, time), 
+                         Model = c(rep("Q-LSTM", length(time)), rep("DCC-GARCH", length(time))))
+
+# Correct model names in data
+cograd_data = data.table(
+  value = c(cogr_NN_time, cogr_garch_time),
+  time = c(time, time),
+  Model = c(rep("Q-CNN-LSTM", length(time)), rep("DCC-GARCH", length(time)))  # match scale keys
+)
+
+cograd_data[, Model := factor(Model, levels = c("DCC-GARCH", "Q-CNN-LSTM"))]
+
+plt6 <- ggplot(cograd_data, aes(time, value, color = Model)) +
+  geom_point(size = 1.5) +
+  geom_line() +
+  ylim(0, 1) +
+  scale_color_manual(values = c("DCC-GARCH" = "blue", "Q-CNN-LSTM" = "green")) +
+  theme_pubr() +
+  theme(legend.position = "right")
+
+plt6
+
+# Your input data.tables: table_ranking_garch, table_ranking (Q-CNN-LSTM)
+setDT(table_ranking_garch)
+setDT(table_ranking)
+
+# Reshape to wide: rows = year, cols = cryptos
+garch_wide <- dcast(table_ranking_garch, anno ~ variable, value.var = "value")
+qcnn_wide  <- dcast(table_ranking, anno ~ variable, value.var = "value")
+
+# Initialize vectors to store Kendall tau values and p-values
+kendall_garch_stability <- numeric()
+kendall_qcnn_stability <- numeric()
+kendall_between_methods <- numeric()
+
+pval_garch_stability <- numeric()
+pval_qcnn_stability <- numeric()
+pval_between_methods <- numeric()
+
+# Calculate Kendall tau and p-values for stability (time t vs t-1)
+for (i in 2:nrow(garch_wide)) {
+  garch_t <- as.numeric(garch_wide[i, -1, with = FALSE])
+  garch_t1 <- as.numeric(garch_wide[i - 1, -1, with = FALSE])
+  test_garch <- cor.test(garch_t, garch_t1, method = "kendall")
+  kendall_garch_stability <- c(kendall_garch_stability, test_garch$estimate)
+  pval_garch_stability <- c(pval_garch_stability, test_garch$p.value)
+  
+  qcnn_t <- as.numeric(qcnn_wide[i, -1, with = FALSE])
+  qcnn_t1 <- as.numeric(qcnn_wide[i - 1, -1, with = FALSE])
+  test_qcnn <- cor.test(qcnn_t, qcnn_t1, method = "kendall")
+  kendall_qcnn_stability <- c(kendall_qcnn_stability, test_qcnn$estimate)
+  pval_qcnn_stability <- c(pval_qcnn_stability, test_qcnn$p.value)
+}
+
+# Calculate Kendall tau and p-values between methods at the same time
+for (i in 1:nrow(garch_wide)) {
+  garch_now <- as.numeric(garch_wide[i, -1, with = FALSE])
+  qcnn_now <- as.numeric(qcnn_wide[i, -1, with = FALSE])
+  test_between <- cor.test(garch_now, qcnn_now, method = "kendall")
+  kendall_between_methods <- c(kendall_between_methods, test_between$estimate)
+  pval_between_methods <- c(pval_between_methods, test_between$p.value)
+}
+
+# Create data frames for Kendall tau and p-values
+results_tau <- data.frame(
+  Type = rep(c("DCC-GARCH Stability", "Q-CNN-LSTM Stability", "Between Methods"), 
+             times = c(length(kendall_garch_stability), length(kendall_qcnn_stability), length(kendall_between_methods))),
+  KendallTau = c(kendall_garch_stability, kendall_qcnn_stability, kendall_between_methods)
+)
+
+results_pval <- data.frame(
+  Type = rep(c("DCC-GARCH Stability", "Q-CNN-LSTM Stability", "Between Methods"), 
+             times = c(length(pval_garch_stability), length(pval_qcnn_stability), length(pval_between_methods))),
+  PValue = c(pval_garch_stability, pval_qcnn_stability, pval_between_methods)
+)
+# Summary statistics for Kendall tau
+print(aggregate(KendallTau ~ Type, data = results_tau, summary))
+# Summary statistics for p-values
+print(aggregate(PValue ~ Type, data = results_pval, summary))
+results_tau$Metric <- "Kendall's Tau"
+names(results_tau)[names(results_tau) == "KendallTau"] <- "Value"
+
+results_pval$Metric <- "P-value"
+names(results_pval)[names(results_pval) == "PValue"] <- "Value"
+
+combined_results <- bind_rows(results_tau, results_pval)
+
+combined_results$Type <- factor(combined_results$Type,
+                                levels = c("DCC-GARCH Stability", "Q-CNN-LSTM Stability", "Between Methods"),
+                                labels = c("DCC-GARCH", "Q-CNN-LSTM", "Between Methods"))
+p_tau <- ggplot(subset(combined_results, Metric == "Kendall's Tau"),
+                aes(x = Type, y = Value, fill = Type)) +
+  geom_boxplot(alpha = 1) +
+  scale_y_continuous(limits = c(-0.5, 1), expand = expansion(mult = c(0, 0))) +
+  scale_fill_manual(values = c("lightblue", "lightgreen", "pink")) +
+  theme_pubr(base_family = "Times New Roman") +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(y = "Kendall Correlation Coefficient")
+
+p_pval <- ggplot(subset(combined_results, Metric == "P-value"),
+                 aes(x = Type, y = Value, fill = Type)) +
+  geom_boxplot(alpha = 1) +
+  scale_y_continuous(limits = c(-0.05, 1), expand = expansion(mult = c(0, 0))) +
+  scale_fill_manual(values = c("lightblue", "lightgreen", "pink")) +
+  theme_pubr(base_family = "Times New Roman") +
+  theme(legend.position = "none") +
+  labs(y = "P-value")
+
+plt7<-p_tau + p_pval + plot_layout(ncol = 2)
+
+plt7
+
+
+
