@@ -525,7 +525,7 @@ plt6 <- ggplot(cograd_data, aes(time, value, color = Model)) +
 
 plt6
 
-# Your input data.tables: table_ranking_garch, table_ranking (Q-CNN-LSTM)
+# Input data.tables: table_ranking_garch, table_ranking (Q-CNN-LSTM)
 setDT(table_ranking_garch)
 setDT(table_ranking)
 
