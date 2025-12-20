@@ -279,7 +279,7 @@ for(k in 1:dim(delta_covar)[2]){
   all_corrNN = rbind(all_corrNN, bacfdf)
 }
 # --------------------------------------------------------------------------
-q=qnorm(0.01,mean=0,sd=1)
+q=qt(0.01,df=5)
 delta_covar_garch=matrix(nrow=N[1],ncol=N[2])
 delta_covar_garch = data.table(delta_covar_garch)
 fitted_returns_garch=matrix(nrow=N[1],ncol=N[2])
